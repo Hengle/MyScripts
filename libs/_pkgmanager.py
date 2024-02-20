@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from functools import lru_cache
 from typing import Dict, Optional
 
 from _shutil import (
@@ -66,6 +67,30 @@ def require_package(pkg, wsl=False, env: Optional[Dict[str, str]] = None):
                     logging.info(f"Installing go package: {go_pkg_path}...")
                     subprocess.check_call(["go", "install", go_pkg_path])
                 return
+
+        elif "npm" in packages[pkg]:
+            for p in packages[pkg]["npm"]["packages"]:
+                if not is_npm_global_package_installed(p):
+                    logging.info(f"Installing package using npm: {p}")
+                    subprocess.check_call(
+                        (["sudo"] if sys.platform == "linux" else [])
+                        + ["npm", "install", "-g", p],
+                        shell=sys.platform == "win32",
+                    )
+            return
+
+        elif "yarn" in packages[pkg]:
+            for p in packages[pkg]["yarn"]["packages"]:
+                logging.info(f"Installing package using npm: {p}")
+                subprocess.check_call(["yarn", "global", "add", p])
+                yarn_global_bin_path = subprocess.check_output(
+                    ["yarn", "global", "bin"], universal_newlines=True
+                ).strip()
+                prepend_to_path(
+                    yarn_global_bin_path,
+                    env=env,
+                )
+            return
 
         elif "pacman" in packages[pkg] and shutil.which("pacman"):
             for p in packages[pkg]["pacman"]["packages"]:
@@ -153,6 +178,22 @@ def require_package(pkg, wsl=False, env: Optional[Dict[str, str]] = None):
     raise Exception(f"{pkg} cannot be found.")
 
 
+@lru_cache(maxsize=None)
+def is_npm_global_package_installed(p):
+    return (
+        subprocess.call(
+            ["npm", "list", "-g", p],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            shell=sys.platform == "win32",
+            creationflags=(
+                subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
+            ),  # prevent title change
+        )
+        == 0
+    )
+
+
 def install_package(pkg, wsl=False):
     logging.info(f"Install package: {pkg}")
     require_package(pkg, wsl=wsl)
@@ -173,11 +214,24 @@ def _is_go_package_installed(go_pkg_path):
     )
 
 
+def _choco_is_package_installed(name: str) -> bool:
+    use_builtin_choco_command = False
+    if use_builtin_choco_command:
+        # Note that the "--localonly" option has been removed in Chocolatey 2.0 and higher.
+        out = check_output(["choco", "list", "--exact", "--localonly", name])
+        return "0 packages installed" not in out
+    else:
+        path = shutil.which("choco")
+        if path:
+            lib_path = os.path.abspath(os.path.dirname(path) + f"\\..\\lib\\{name}")
+            return os.path.exists(lib_path)
+        else:
+            raise Exception("choco is not installed.")
+
+
 def _choco_install(pkg, upgrade=False):
     for p in packages[pkg]["choco"]["packages"]:
-        out = check_output(["choco", "list", "--local", "--exact", p])
-
-        if "0 packages installed" in out:
+        if not _choco_is_package_installed(p):
             logging.info("Install `%s`..." % p)
             run_elevated(
                 ["choco", "install", p, "-y", "-s", "https://chocolatey.org/api/v2/"],
@@ -188,6 +242,9 @@ def _choco_install(pkg, upgrade=False):
             run_elevated(
                 ["choco", "upgrade", p, "-y", "-s", "https://chocolatey.org/api/v2/"],
             )
+
+        else:
+            logging.debug(f'Package "{p}" already exists, skip installation.')
 
     refresh_env_vars()
 

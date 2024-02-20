@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -55,6 +56,7 @@ from _template import render_template
 from utils.clip import get_clip, get_selection
 from utils.term.alacritty import is_alacritty_installed, wrap_args_alacritty
 from utils.timed import timed
+from utils.tmux import is_in_tmux
 from utils.venv import activate_python_venv, get_venv_python_executable
 
 SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -88,9 +90,18 @@ if sys.platform == "win32":
 
 VARIABLE_NAME_EXCLUDE = {"HOME", "PATH"}
 
-LOG_PIPE_FOR_BACKGROUND_PROCESS = True
+
+class BackgroundProcessOutputType(IntEnum):
+    LOG_PIPE = 1
+    REDIRECT_TO_FILE = 2
+
+
+background_process_output_type = BackgroundProcessOutputType.REDIRECT_TO_FILE
+
 
 SUPPORT_GNU_SCREEN = False
+
+DEFAULT_LINUX_TERMINAL = "alacritty"
 
 
 @lru_cache(maxsize=None)
@@ -156,7 +167,6 @@ def get_script_dirs_config_file():
 class ScriptDirectory:
     name: str
     path: str  # absolute path of script directory
-    include_exts: List[str]
 
 
 @lru_cache(maxsize=None)
@@ -165,9 +175,7 @@ def get_script_directories() -> List[ScriptDirectory]:
 
     # Default script root path
     directories.append(
-        ScriptDirectory(
-            name="", path=os.path.join(get_my_script_root(), "scripts"), include_exts=[]
-        )
+        ScriptDirectory(name="", path=os.path.join(get_my_script_root(), "scripts"))
     )
 
     config_file = get_script_dirs_config_file()
@@ -186,10 +194,7 @@ def get_script_directories() -> List[ScriptDirectory]:
                 )
             )
 
-        include_exts = item["includeExts"] if "includeExts" in item else []
-        directories.append(
-            ScriptDirectory(name=name, path=directory, include_exts=include_exts)
-        )
+        directories.append(ScriptDirectory(name=name, path=directory))
 
     return directories
 
@@ -653,7 +658,7 @@ class LogPipe(threading.Thread):
 
     def log(self):
         for line in iter(self.read_pipe.readline, b""):
-            logging.log(self.level, line.strip(b"\n").decode())
+            logging.log(self.level, ">>> " + line.strip(b"\n").decode())
 
         self.read_pipe.close()
 
@@ -742,6 +747,8 @@ class Script:
             s += " (%s)" % (get_hotkey_abbr(self.cfg["hotkey"]))
         if self.cfg["globalHotkey"]:
             s += " {%s}" % (get_hotkey_abbr(self.cfg["globalHotkey"]))
+        if self.cfg["autoRun"]:
+            s += " [autorun]"
 
         return s
 
@@ -874,6 +881,49 @@ class Script:
     def get_context(self) -> Dict[str, str]:
         return {"HOME": get_home_path(), "SCRIPT": quote_arg(self.script_path)}
 
+    def activate_window(self) -> bool:
+        title = self.get_window_title()
+        if (
+            SUPPORT_GNU_SCREEN
+            and shutil.which("screen")
+            and subprocess.call(["screen", "-r", slugify(title)]) == 0
+        ):
+            return True
+
+        elif activate_window_by_name(title):
+            logging.info(f"Activated window by title: {title}")
+            return True
+
+        else:
+            return False
+
+    def close_window(self):
+        if (
+            SUPPORT_GNU_SCREEN
+            and shutil.which("screen")
+            and subprocess.call(
+                [
+                    "screen",
+                    "-S",
+                    slugify(self.get_window_title()),
+                    "-X",
+                    "quit",
+                ]
+            )
+            == 0
+        ):
+            pass
+
+        else:
+            # Close exising instances
+            close_window_by_name(self.get_window_title())
+
+    def get_script_log_file(self) -> str:
+        log_dir = os.path.join(get_data_dir(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, slugify(self.get_window_title())) + ".log"
+        return log_file
+
     def execute(
         self,
         args: List[str] = [],
@@ -921,16 +971,7 @@ class Script:
             restart_instance = True
 
         if new_window and not restart_instance and single_instance:
-            title = self.get_window_title()
-            if (
-                SUPPORT_GNU_SCREEN
-                and shutil.which("screen")
-                and subprocess.call(["screen", "-r", slugify(title)]) == 0
-            ):
-                return True
-
-            elif activate_window_by_name(title):
-                logging.info(f"Activated window by title: {title}")
+            if self.activate_window():
                 return True
 
         # Get variable name value pairs
@@ -962,6 +1003,22 @@ class Script:
                 selection = get_selection()
                 temp_file = write_temp_file(selection, ".txt")
                 arg_list.append(temp_file)
+
+            elif self.cfg["args.passUserInput"]:
+                from utils.menu.input import Input
+
+                text = Input().input()
+                if not text:
+                    return True
+                arg_list.append(text)
+
+            elif self.cfg["args.passSelection"]:
+                selection = get_selection()
+                arg_list.append(selection)
+
+            elif self.cfg["args.passClipboard"]:
+                clipboard = get_clip()
+                arg_list.append(clipboard)
 
             elif self.cfg["args.passClipboardAsFile"]:
                 clipboard = get_clip()
@@ -1004,9 +1061,9 @@ class Script:
             setup_android_env(
                 env=env,
                 jdk_version=self.cfg["adk.jdk_version"],
-                android_home=variables["ANDROID_HOME"]
-                if "ANDROID_HOME" in variables
-                else None,
+                android_home=(
+                    variables["ANDROID_HOME"] if "ANDROID_HOME" in variables else None
+                ),
             )
 
         if self.cfg["cmake"]:
@@ -1036,14 +1093,15 @@ class Script:
             if android_serial:
                 env["ANDROID_SERIAL"] = android_serial
 
-        if self.cfg["workingDir"]:
-            cwd = self.cfg["workingDir"].format(**self.get_context())
-            if not os.path.exists(cwd):
-                os.makedirs(cwd, exist_ok=True)
-        elif cd:
-            cwd = os.path.abspath(
-                os.path.join(os.getcwd(), os.path.dirname(script_path))
-            )
+        if cd:
+            if self.cfg["workingDir"]:
+                cwd = self.cfg["workingDir"].format(**self.get_context())
+                if not os.path.exists(cwd):
+                    os.makedirs(cwd, exist_ok=True)
+            else:
+                cwd = os.path.abspath(
+                    os.path.join(os.getcwd(), os.path.dirname(script_path))
+                )
         else:
             cwd = None
 
@@ -1277,9 +1335,12 @@ class Script:
             if "%s" in url:
                 from utils.menu.input import Input
 
-                keyword = Input().input()
-                if not keyword:
-                    return True
+                if len(arg_list) == 1:
+                    keyword = arg_list[0]
+                else:
+                    keyword = Input().input()
+                    if not keyword:
+                        return True
                 url = url.replace("%s", keyword)
 
             fallback_to_shell_open = True
@@ -1291,7 +1352,12 @@ class Script:
                     )
                 for chrome_exec in chrome_executables:
                     if shutil.which(chrome_exec):
-                        start_process([chrome_exec, "--chrome-frame", "--app=" + url])
+                        # args = [chrome_exec, "--new-window"]
+                        # if self.cfg["title"]:
+                        #     args.append(f"--window-name={self.cfg['title']}")
+                        # args.append(url)
+                        args = [chrome_exec, f"--app={url}"]
+                        start_process(args)
                         fallback_to_shell_open = False
                         break
 
@@ -1380,10 +1446,23 @@ class Script:
                         | subprocess.CREATE_NEW_PROCESS_GROUP
                     )
 
-                if LOG_PIPE_FOR_BACKGROUND_PROCESS:
+                if (
+                    background_process_output_type
+                    == BackgroundProcessOutputType.LOG_PIPE
+                ):
                     popen_extra_args["stdin"] = subprocess.DEVNULL
                     popen_extra_args["stdout"] = subprocess.PIPE
                     popen_extra_args["stderr"] = subprocess.PIPE
+
+                elif (
+                    background_process_output_type
+                    == BackgroundProcessOutputType.REDIRECT_TO_FILE
+                ):
+                    fd = open(self.get_script_log_file(), "w")
+                    popen_extra_args["stdin"] = subprocess.DEVNULL
+                    popen_extra_args["stdout"] = fd
+                    popen_extra_args["stderr"] = fd
+
                 else:
                     popen_extra_args["stdin"] = subprocess.DEVNULL
                     popen_extra_args["stdout"] = subprocess.DEVNULL
@@ -1406,25 +1485,7 @@ class Script:
 
             elif new_window:
                 if restart_instance and single_instance:
-                    if (
-                        SUPPORT_GNU_SCREEN
-                        and shutil.which("screen")
-                        and subprocess.call(
-                            [
-                                "screen",
-                                "-S",
-                                slugify(self.get_window_title()),
-                                "-X",
-                                "quit",
-                            ]
-                        )
-                        == 0
-                    ):
-                        pass
-
-                    else:
-                        # Close exising instances
-                        close_window_by_name(self.get_window_title())
+                    self.close_window()
 
                 try:
                     if sys.platform == "win32":
@@ -1480,90 +1541,107 @@ class Script:
                             open_in_terminal = True
 
                         else:
-                            arg_list = wrap_args_cmd(
-                                arg_list,
-                                cwd=cwd,
-                                title=self.get_window_title(),
-                                env=env,
+                            logging.warning(
+                                "No terminal installed, ignore `newWindow` option."
                             )
-                            popen_extra_args["creationflags"] = (
-                                subprocess.CREATE_NEW_CONSOLE
-                                | subprocess.CREATE_NEW_PROCESS_GROUP
-                            )
-                            no_wait = True
-                            open_in_terminal = True
 
                     elif sys.platform == "linux":
-                        TERMINAL = "alacritty"
-                        if TERMINAL == "gnome":
-                            arg_list = [
-                                "gnome-terminal",
-                                "--",
-                                "bash",
-                                "-c",
-                                "%s || read -rsn1 -p 'Press any key to exit...'"
-                                % _args_to_str(arg_list, shell_type="bash"),
-                            ]
-
-                        elif TERMINAL == "xterm":
-                            arg_list = [
-                                "xterm",
-                                "-xrm",
-                                "XTerm.vt100.allowTitleOps: false",
-                                "-T",
-                                self.get_window_title(),
-                                "-e",
-                                _args_to_str(arg_list, shell_type="bash"),
-                            ]
-                            no_wait = True
-                            open_in_terminal = True
-
-                        elif TERMINAL == "xfce":
-                            arg_list = [
-                                "xfce4-terminal",
-                                "-T",
-                                self.get_window_title(),
-                                "-e",
-                                _args_to_str(arg_list, shell_type="bash"),
-                                "--hold",
-                            ]
-                            no_wait = True
-                            open_in_terminal = True
-
-                        elif TERMINAL == "kitty":
-                            arg_list = [
-                                "kitty",
-                                "--title",
-                                self.get_window_title(),
-                            ] + arg_list
-                            no_wait = True
-                            open_in_terminal = True
-
-                        elif TERMINAL == "alacritty" and is_alacritty_installed():
-                            arg_list = wrap_args_alacritty(
-                                arg_list,
-                                title=self.get_window_title(),
+                        if is_in_tmux():
+                            arg_list = (
+                                [
+                                    "tmux",
+                                    # "split-window",
+                                    "new-window",
+                                    "-n",
+                                    slugify(self.get_window_title()),
+                                ]
+                                + [  # Pass environmental variable to new window.
+                                    item
+                                    for k, v in env.items()
+                                    for item in ("-e", f"{k}={v}")
+                                ]
+                                + arg_list
                             )
-                            no_wait = True
-                            open_in_terminal = True
 
-                        elif SUPPORT_GNU_SCREEN and shutil.which("screen"):
-                            arg_list = [
-                                "screen",
-                                "-S",
-                                slugify(self.get_window_title()),
-                            ] + arg_list
+                        elif os.environ.get("DISPLAY"):
+                            term_emulator = DEFAULT_LINUX_TERMINAL
+                            if term_emulator == "gnome":
+                                arg_list = [
+                                    "gnome-terminal",
+                                    "--",
+                                    "bash",
+                                    "-c",
+                                    "%s || read -rsn1 -p 'Press any key to exit...'"
+                                    % _args_to_str(arg_list, shell_type="bash"),
+                                ]
+
+                            elif term_emulator == "xterm":
+                                arg_list = [
+                                    "xterm",
+                                    "-xrm",
+                                    "XTerm.vt100.allowTitleOps: false",
+                                    "-T",
+                                    self.get_window_title(),
+                                    "-e",
+                                    _args_to_str(arg_list, shell_type="bash"),
+                                ]
+                                no_wait = True
+                                open_in_terminal = True
+
+                            elif term_emulator == "xfce":
+                                arg_list = [
+                                    "xfce4-terminal",
+                                    "-T",
+                                    self.get_window_title(),
+                                    "-e",
+                                    _args_to_str(arg_list, shell_type="bash"),
+                                    "--hold",
+                                ]
+                                no_wait = True
+                                open_in_terminal = True
+
+                            elif term_emulator == "kitty":
+                                arg_list = [
+                                    "kitty",
+                                    "--title",
+                                    self.get_window_title(),
+                                ] + arg_list
+                                no_wait = True
+                                open_in_terminal = True
+
+                            elif (
+                                term_emulator == "alacritty"
+                                and is_alacritty_installed()
+                            ):
+                                arg_list = wrap_args_alacritty(
+                                    arg_list,
+                                    title=self.get_window_title(),
+                                )
+                                no_wait = True
+                                open_in_terminal = True
+
+                            elif SUPPORT_GNU_SCREEN and shutil.which("screen"):
+                                arg_list = [
+                                    "screen",
+                                    "-S",
+                                    slugify(self.get_window_title()),
+                                ] + arg_list
+
+                            else:
+                                raise FileNotFoundError(
+                                    "No terminal is available for `newWindow` on linux."
+                                )
 
                         else:
-                            raise FileNotFoundError(
-                                "No terminal is available for `newWindow` on linux."
-                            )
+                            new_window = False
+                            no_wait = False
 
                     else:
                         logging.warning(
                             '"new_window" is not implemented on platform "%s"'
                             % sys.platform
                         )
+
                 except FileNotFoundError as ex:
                     new_window = False
                     no_wait = False
@@ -1574,7 +1652,7 @@ class Script:
                 if sys.platform == "linux":
                     popen_extra_args["start_new_session"] = True
 
-            if use_shell_execute_win32:
+            if sys.platform == "win32" and use_shell_execute_win32:
                 SW_SHOWNORMAL = 1
                 lpParameters = _args_to_str(arg_list[1:], shell_type="cmd")
                 logging.debug(
@@ -1625,9 +1703,22 @@ class Script:
                     with IgnoreSigInt():
                         success = self.ps.wait() == 0
 
-                if LOG_PIPE_FOR_BACKGROUND_PROCESS and background:
-                    LogPipe(self.ps.stdout, log_level=logging.ERROR)
-                    LogPipe(self.ps.stderr, log_level=logging.ERROR)
+                if background:
+                    if (
+                        background_process_output_type
+                        == BackgroundProcessOutputType.LOG_PIPE
+                    ):
+                        LogPipe(self.ps.stdout, log_level=logging.INFO)
+                        LogPipe(self.ps.stderr, log_level=logging.INFO)
+                    elif (
+                        background_process_output_type
+                        == BackgroundProcessOutputType.REDIRECT_TO_FILE
+                    ):
+                        # Close fd immediately. If we don't call `close()` the
+                        # file handles will remain open in the parent process,
+                        # which can cause potential issues like having many open
+                        # file descriptors.
+                        fd.close()
 
                 return success
 
@@ -1663,6 +1754,9 @@ class Script:
         ]
 
         variable_names = [x for x in variable_names if x not in VARIABLE_NAME_EXCLUDE]
+
+        # Sort the variable names
+        variable_names = sorted(variable_names)
 
         return variable_names
 
@@ -1814,10 +1908,13 @@ def get_default_script_config() -> Dict[str, Any]:
     return {
         "adk.jdk_version": "",
         "adk": False,
+        "args.passClipboard": False,
         "args.passClipboardAsFile": False,
         "args.passSelectedDir": False,
         "args.passSelectedFile": False,
+        "args.passSelection": False,
         "args.passSelectionAsFile": False,
+        "args.passUserInput": False,
         "args": "",
         "autoRun": False,
         "background": False,
@@ -1974,7 +2071,20 @@ def get_all_script_access_time() -> Dict[str, float]:
     return _cached_script_access_time
 
 
+script_dir_config_file = ".scriptdirconfig.json"
+
+
+def get_default_script_dir_config():
+    return {"includeExts": ""}
+
+
 def get_scripts_recursive(directory, include_exts=[]) -> Iterator[str]:
+    dir_config = load_json(
+        os.path.join(directory, script_dir_config_file),
+        default=get_default_script_dir_config(),
+    )
+    include_exts += dir_config["includeExts"].split()
+
     def should_ignore(dir, file):
         if (
             file == "tmp"
@@ -2009,7 +2119,7 @@ def get_scripts_recursive(directory, include_exts=[]) -> Iterator[str]:
 
 def get_all_scripts() -> Iterator[str]:
     for d in get_script_directories():
-        files = get_scripts_recursive(d.path, include_exts=d.include_exts)
+        files = get_scripts_recursive(d.path)
         for file in files:
             # File has been removed during iteration
             if not os.path.exists(file):
@@ -2027,7 +2137,7 @@ def execute_script_autorun(script: Script):
     assert script.cfg["autoRun"] or script.cfg["runAtStartup"]
     try:
         logging.debug("autorun: %s" % script.name)
-        script.execute(new_window=False, command_wrapper=False)
+        script.execute(command_wrapper=False)
     except Exception as ex:
         logging.warning(f"Failed to autorun script: {script.script_path}")
         logging.exception(ex)

@@ -1,12 +1,12 @@
 # ruff: noqa: E402
 
 import argparse
-import ctypes
 import logging
 import logging.config
 import os
 import platform
 import re
+import shutil
 import sys
 import threading
 import time
@@ -49,10 +49,13 @@ from _shutil import (
     setup_logger,
     setup_nodejs,
 )
+from utils.clip import set_clip
+from utils.fileutils import read_last_line
 from utils.menu import Menu
 from utils.menu.confirm import confirm
 from utils.menu.dictedit import DictEditMenu
 from utils.menu.filemgr import FileManager
+from utils.menu.logviewer import LogViewerMenu
 from utils.menu.textinput import TextInput
 from utils.timeutil import time_diff_str
 
@@ -61,39 +64,6 @@ KEY_CODE_CTRL_ENTER_WIN = 529
 
 
 script_server: Optional[ScriptServer] = None
-
-
-def setup_console_font():
-    if sys.platform == "win32":
-        LF_FACESIZE = 32
-        STD_OUTPUT_HANDLE = -11
-
-        class COORD(ctypes.Structure):
-            _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
-
-        class CONSOLE_FONT_INFOEX(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", ctypes.c_ulong),
-                ("nFont", ctypes.c_ulong),
-                ("dwFontSize", COORD),
-                ("FontFamily", ctypes.c_uint),
-                ("FontWeight", ctypes.c_uint),
-                ("FaceName", ctypes.c_wchar * LF_FACESIZE),
-            ]
-
-        font = CONSOLE_FONT_INFOEX()
-        font.cbSize = ctypes.sizeof(CONSOLE_FONT_INFOEX)
-        font.nFont = 12
-        font.dwFontSize.X = 11
-        font.dwFontSize.Y = 18
-        font.FontFamily = 54
-        font.FontWeight = 400
-        font.FaceName = "Lucida Console"
-
-        handle = ctypes.windll.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        ctypes.windll.kernel32.SetCurrentConsoleFontEx(
-            handle, ctypes.c_long(False), ctypes.pointer(font)
-        )
 
 
 def format_key_value_pairs(kvp):
@@ -136,7 +106,7 @@ class VariableEditMenu(DictEditMenu):
             dict_history=self.variable_edit_history,
         )
 
-        self.add_command(self.__select_directory, hotkey="ctrl+d")
+        self.add_command(self.__select_directory, hotkey="alt+d")
 
     def on_dict_history_update(self, history: Dict[str, List[Any]]):
         save_json(get_variable_edit_history_file(), history)
@@ -144,7 +114,7 @@ class VariableEditMenu(DictEditMenu):
     def __select_directory(self):
         key = self.get_selected_key()
         if key is not None:
-            dir_path = FileManager().select_directory()
+            dir_path = FileManager(goto=self.get_value(key)).select_directory()
             if dir_path is not None:
                 self.set_dict_value(key, dir_path)
 
@@ -168,8 +138,46 @@ def restart_program():
     )
 
 
+class _ScheduledScript:
+    def __init__(self, script: Script, scheduled_time: float) -> None:
+        self.script = script
+        self.scheduled_time = scheduled_time
+
+    def __str__(self) -> str:
+        script_log_file = self.script.get_script_log_file()
+        if os.path.exists(script_log_file):
+            last_line = read_last_line(script_log_file)
+        else:
+            last_line = None
+
+        return f"{time_diff_str(self.scheduled_time):<10} : {os.path.basename(self.script.script_path):<24} : {last_line}"
+
+
+class _ScheduledScriptMenu(Menu[_ScheduledScript]):
+    def __init__(self, script_manager: ScriptManager):
+        items = [
+            _ScheduledScript(script=script, scheduled_time=scheduled_time)
+            for script, scheduled_time in script_manager.get_scheduled_scripts_run_time().items()
+        ]
+        super().__init__(items=items, prompt=": scheduled scripts:")
+
+    def on_idle(self):
+        self.update_screen()
+        return super().on_idle()
+
+    def on_enter_pressed(self):
+        item = self.get_selected_item()
+        if item is not None:
+            script_log_file = item.script.get_script_log_file()
+            if os.path.exists(script_log_file):
+                LogViewerMenu(file=script_log_file).exec()
+
+
 class _MyScriptMenu(Menu[Script]):
-    def __init__(self, no_gui=False, run_script_and_quit=False):
+    def __init__(
+        self, script_manager: ScriptManager, no_gui=False, run_script_and_quit=False
+    ):
+        self.script_manager = script_manager
         self.no_gui = no_gui
         self.last_refresh_time = 0.0
         self.is_refreshing = False
@@ -178,20 +186,22 @@ class _MyScriptMenu(Menu[Script]):
         self.__last_copy_time = 0.0
 
         super().__init__(
-            items=script_manager.scripts,
+            items=self.script_manager.scripts,
             ascii_only=False,
             cancellable=run_script_and_quit,
             prompt=platform.node() + "$",
         )
 
         self.add_command(self._copy_cmdline, hotkey="ctrl+y")
+        self.add_command(self._copy_script_path, hotkey="alt+y")
         self.add_command(self._delete_file)
         self.add_command(self._duplicate_script, hotkey="ctrl+d")
         self.add_command(self._edit_script_settings, hotkey="ctrl+s")
         self.add_command(self._edit_script, hotkey="ctrl+e")
         self.add_command(self._new_script, hotkey="ctrl+n")
         self.add_command(self._next_scheduled_script, hotkey="alt+t")
-        self.add_command(self._on_alt_enter_pressed, hotkey="alt+enter")
+        self.add_command(self._run_without_close_on_exist, hotkey="alt+enter")
+        self.add_command(self._run_without_close_on_exist, hotkey="ctrl+enter")
         self.add_command(self._reload_scripts, hotkey="ctrl+r")
         self.add_command(self._reload, hotkey="alt+l")
         self.add_command(self._rename_script_and_replace_all)
@@ -202,11 +212,7 @@ class _MyScriptMenu(Menu[Script]):
         self.call_func_without_curses(lambda: restart_program())
 
     def _next_scheduled_script(self):
-        items = [
-            f"{os.path.basename(script_path)} ({time_diff_str(ts)})"
-            for script_path, ts in script_manager.next_scheduled_script_run_time.items()
-        ]
-        Menu(items=items, prompt="scheduled scripts:").exec()
+        _ScheduledScriptMenu(script_manager=self.script_manager).exec()
 
     def _set_cmdline_args(self):
         script = self.get_selected_script()
@@ -235,7 +241,7 @@ class _MyScriptMenu(Menu[Script]):
         ):
             self._reload_scripts()
 
-        for script in script_manager.get_scheduled_scripts_to_run():
+        for script in self.script_manager.get_scheduled_scripts_to_run():
 
             def exec_script():
                 script.execute(
@@ -246,7 +252,10 @@ class _MyScriptMenu(Menu[Script]):
                     background=True,
                 )
 
-            self.call_func_without_curses(exec_script)
+            try:
+                self.call_func_without_curses(exec_script)
+            except Exception as ex:
+                logging.error(f"Error on running scheduled script: {ex}")
 
     def match_item(self, keyword: str, script: Script) -> bool:
         if script.match_pattern(keyword):
@@ -260,7 +269,7 @@ class _MyScriptMenu(Menu[Script]):
             script = self.items[index]
 
             script.update_script_access_time()
-            script_manager.sort_scripts()
+            self.script_manager.sort_scripts()
             self.refresh()
 
             self.call_func_without_curses(
@@ -312,9 +321,11 @@ class _MyScriptMenu(Menu[Script]):
         def on_process():
             nonlocal self
             self.process_events()
-            self.set_message("refreshing scripts: %d" % len(script_manager.scripts))
+            self.set_message(
+                "refreshing scripts: %d" % len(self.script_manager.scripts)
+            )
 
-        script_manager.refresh_all_scripts(
+        self.script_manager.refresh_all_scripts(
             on_progress=on_process, on_register_hotkeys=self._on_register_hotkeys
         )
         self.set_message()
@@ -344,6 +355,13 @@ class _MyScriptMenu(Menu[Script]):
 
             self.__last_copy_time = now
 
+    def _copy_script_path(self):
+        script = self.get_selected_script()
+        if script:
+            script_path = script.get_script_path()
+            set_clip(script_path)
+            self.set_message(f"copied: {script_path}")
+
     def _new_script_or_duplicate_script(self, duplicate=False):
         ref_script_path = self.get_selected_script_path()
         if ref_script_path:
@@ -352,7 +370,7 @@ class _MyScriptMenu(Menu[Script]):
             )
             if script_path:
                 script = Script(script_path)
-                script_manager.scripts.insert(0, script)
+                self.script_manager.scripts.insert(0, script)
         self.clear_input()
 
     def _new_script(self):
@@ -392,10 +410,10 @@ class _MyScriptMenu(Menu[Script]):
     def update_last_refresh_time(self):
         self.last_refresh_time = time.time()
 
-    def _on_alt_enter_pressed(self):
+    def _run_without_close_on_exist(self):
         try:
             self.run_selected_script(close_on_exit=False)
-            self.clear_input()
+            self.clear_input(reset_selection=True)
         finally:
             # Reset last refresh time when key press event is processed
             self.update_last_refresh_time()
@@ -419,14 +437,14 @@ class _MyScriptMenu(Menu[Script]):
 
     def on_enter_pressed(self):
         self.run_selected_script()
-        self.clear_input()
+        self.clear_input(reset_selection=True)
         return True
 
     def on_escape_pressed(self):
         self.clear_input()
 
     def on_idle(self):
-        try_reload_scripts_autorun(script_manager.scripts_autorun)
+        try_reload_scripts_autorun(self.script_manager.scripts_autorun)
 
     def on_item_selection_changed(self, script: Optional[Script]):
         text = self.get_input()
@@ -454,7 +472,7 @@ class _MyScriptMenu(Menu[Script]):
                     if len(vars) > 0:
                         preview.extend(
                             [
-                                ("cyan", x)
+                                ("yellow", x)
                                 for x in format_variables(
                                     vars,
                                     sorted(script.get_variable_names()),
@@ -474,7 +492,7 @@ class _MyScriptMenu(Menu[Script]):
                     if value != default_script_config[name]:
                         config_preview[f"cfg : {name}"] = str(value)
                 preview.extend(
-                    [("magenta", x) for x in format_key_value_pairs(config_preview)]
+                    [("yellow", x) for x in format_key_value_pairs(config_preview)]
                 )
 
                 height = max(5, height - len(preview) - 1)
@@ -499,17 +517,16 @@ class _MyScriptMenu(Menu[Script]):
             else:
                 if script.cfg["updateSelectedScriptAccessTime"]:
                     selected_script.update_script_access_time()
-                script_manager.sort_scripts()
+                self.script_manager.sort_scripts()
                 self.refresh()
             return True
 
 
-def _init(no_gui=False):
+def _main(no_gui=False):
     global script_server
 
-    if not no_gui and is_instance_running():
-        print("An instance is already running, exiting.")
-        sys.exit(0)
+    start_daemon = not is_instance_running()
+    logging.debug(f"start_daemon: {start_daemon}")
 
     logging.info("Python executable: %s" % sys.executable)
 
@@ -527,16 +544,20 @@ def _init(no_gui=False):
 
     setup_nodejs(install=False)
 
-    if not no_gui:
+    if start_daemon:
         script_server = ScriptServer()
         script_server.start_server()
 
+    script_manager = ScriptManager(start_daemon=start_daemon, startup=args.startup)
 
-def _main_loop(no_gui=False, run_script_and_quit=False):
-    _init(no_gui=no_gui)
+    run_script_and_quit = args.cmd == "r" or args.cmd == "run"
     while True:  # repeat if _MyScriptMenu throws exceptions
         try:
-            _MyScriptMenu(no_gui=no_gui, run_script_and_quit=run_script_and_quit).exec()
+            _MyScriptMenu(
+                script_manager=script_manager,
+                no_gui=no_gui,
+                run_script_and_quit=run_script_and_quit,
+            ).exec()
             if run_script_and_quit:
                 break
 
@@ -566,16 +587,31 @@ if __name__ == "__main__":
         action="store_true",
         help="will autorun all scripts with runAtStartup=True",
     )
+    parser.add_argument(
+        "-t",
+        "--tmux",
+        action="store_true",
+        help="Run in tmux.",
+    )
     args = parser.parse_args()
+
+    if args.tmux:
+        tmux_exec = shutil.which("tmux")
+        if tmux_exec is None:
+            raise Exception("tmux is not installed.")
+        os.execl(
+            tmux_exec,
+            "tmux",
+            "-f",
+            os.path.join(MYSCRIPT_ROOT, "settings", "tmux", ".tmux.conf"),
+            "new",
+            sys.executable,
+            *(x for x in sys.argv if x not in ("-t", "--tmux")),
+        )
 
     run_at_startup(
         name="MyScripts",
         cmdline=quote_arg(os.path.join(MYSCRIPT_ROOT, "myscripts.cmd")) + " --startup",
     )
 
-    # setup_console_font()
-    script_manager = ScriptManager(no_gui=args.no_gui, startup=args.startup)
-    if args.cmd == "r" or args.cmd == "run":
-        _main_loop(no_gui=True, run_script_and_quit=True)
-    else:
-        _main_loop(no_gui=args.no_gui)
+    _main(no_gui=args.no_gui)

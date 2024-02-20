@@ -79,12 +79,22 @@ pac_install alsa-utils # for amixer CLI command
 # # Disable extra trigger key
 # sed -iE 's/#?#UseExtraTriggerKeyOnlyWhenUseItToInactivate=.*/UseExtraTriggerKeyOnlyWhenUseItToInactivate=False/' ~/.config/fcitx/config
 
-# Disable CapsLock key
-append_line_dedup ~/.xinitrc "setxkbmap -option caps:none"
-
 # https://wiki.archlinux.org/title/Fcitx5
 pac_install fcitx5 fcitx5-qt fcitx5-gtk fcitx5-config-qt fcitx5-chinese-addons
 append_line_dedup ~/.xinitrc "fcitx5 -d"
+
+# Key mapping using https://github.com/rvaiya/keyd
+# Map CapsLock to Control+Meta key
+yay_install keyd
+sudo tee /etc/keyd/default.conf <<EOF
+[ids]
+*
+[main]
+capslock = overload(capslock, esc)
+
+[capslock:C-M]
+EOF
+sudo systemctl enable keyd.service --now
 
 # Automatically run startx without using display manager / login manager.
 append_line_dedup \
@@ -109,6 +119,8 @@ fi
 
 # Hardware specific (TODO: move)
 yay_install k380-function-keys-conf
+pac_install solaar # Logitech device manager
+append_line_dedup ~/.xinitrc 'solaar --window hide &'
 
 # Configure Touchpad:
 # https://wiki.archlinux.org/title/Touchpad_Synaptics
@@ -122,9 +134,14 @@ Section "InputClass"
 EndSection
 EOF
 
+# Screenshot
+pac_install flameshot
+append_line_dedup ~/.xinitrc 'flameshot &'
+
 # Auto-start MyScript
 append_line_dedup ~/.xinitrc 'alacritty -e "$HOME/MyScripts/myscripts" --startup &'
 
+# Replace the current process with the awesomewm when initializing X.
 append_line_dedup ~/.xinitrc "exec awesome"
 
 # Disable sudo password
@@ -132,4 +149,6 @@ append_line_sudo /etc/sudoers "$(whoami) ALL=(ALL:ALL) NOPASSWD: ALL"
 
 # Install GitHub CLI
 pac_install github-cli
-[[ "$(gh auth status 2>&1)" =~ "not logged" ]] && gh auth login
+if [[ "$(gh auth status 2>&1)" =~ "not logged" ]]; then
+    gh auth login
+fi

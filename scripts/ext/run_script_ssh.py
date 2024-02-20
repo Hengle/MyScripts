@@ -111,7 +111,15 @@ def pull_file_ssh(src, dest=None):
     if dest is None:
         dest = os.getcwd()
 
-    call_echo(["scp", "{}:{}".format(_get_user_host(), src), dest])
+    call_echo(
+        [
+            "scp",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "{}:{}".format(_get_user_host(), src),
+            dest,
+        ]
+    )
 
     return dest
 
@@ -123,7 +131,7 @@ def run_bash_script_putty(bash_script_file, user=None, host=None, pwd=None, port
     _putty_wrapper(
         "plink",
         [
-            "-no-antispoof",
+            # "-no-antispoof",
             "-ssh",
             "-t",
             _get_user_host(user=user, host=host),

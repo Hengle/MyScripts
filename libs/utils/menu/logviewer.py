@@ -27,16 +27,23 @@ class _SelectPresetMenu(Menu[str]):
 
 
 class LogViewerMenu(Menu[str]):
-    def __init__(self, file: str, filter: Optional[str] = None):
+    def __init__(
+        self, file: str, filter: Optional[str] = None, preset_dir: Optional[str] = None
+    ):
         self.__file = file
         self.__file_name = os.path.basename(file)
         self.__lines: List[str] = []
-        self.preset_dir = os.path.join(os.environ["MY_DATA_DIR"], "log_filters")
+        self.preset_dir = (
+            preset_dir
+            if preset_dir
+            else os.path.join(os.environ["MY_DATA_DIR"], "log_filters")
+        )
 
         self.__default_log_highlight: OrderedDict[str, str] = OrderedDict()
-        self.__default_log_highlight[r" D |\bDEBUG\b|\bDebug\b"] = "blue"
-        self.__default_log_highlight[r" W |\bWARN\b|\bWarn(ing)?\b"] = "yellow"
-        self.__default_log_highlight[r" (E|F) |\bERROR\b|\bError\b|>>>"] = "red"
+        self.__default_log_highlight[r" D |\b(DEBUG|Debug|debug)\b"] = "blue"
+        self.__default_log_highlight[r" W |\b(WARN|Warn(ing)?|warn(ing)?)\b"] = "yellow"
+        self.__default_log_highlight[r" (E|F) |\b(ERROR|Error|error)\b"] = "red"
+        self.__default_log_highlight[">>>"] = "green"
         self.__log_highlight = self.__default_log_highlight.copy()
 
         super().__init__(
@@ -98,14 +105,17 @@ class LogViewerMenu(Menu[str]):
 
     def on_enter_pressed(self):
         if self.search_by_input():
-            pass
-        elif self._selected_row_end < len(self._matched_item_indices):
-            row_number = self._matched_item_indices[self._selected_row_end]
-            self.set_selected_row(row_number)
-            self.set_input("")
+            return
+
+        else:
+            self.clear_input()
 
     def get_status_bar_text(self):
-        return self.__file_name + " | " + super().get_status_bar_text()
+        cols = [self.__file_name]
+        text = super().get_status_bar_text()
+        if text:
+            cols.append(text)
+        return " | ".join(cols)
 
     def on_created(self):
         last_update = 0.0

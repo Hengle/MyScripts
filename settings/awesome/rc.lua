@@ -21,7 +21,7 @@ local hotkeys_popup = require("awful.hotkeys_popup")
 -- Enable hotkeys help widget for VIM and other apps
 -- when client with a matching name is opened:
 require("awful.hotkeys_popup.keys")
--- require('mouse-follow-focus')
+require('mouse-follow-focus')
 
 --- Define custom widgets
 local battery_widget = require("battery-widget")
@@ -348,30 +348,6 @@ globalkeys = gears.table.join(awful.key({ modkey }, "s", hotkeys_popup.show_help
         description = "quit awesome",
         group = "awesome"
     }),
-    awful.key({ modkey }, "l", function()
-        awful.tag.incmwfact(0.05)
-    end, {
-        description = "increase master width factor",
-        group = "layout"
-    }),
-    awful.key({ modkey }, "h", function()
-        awful.tag.incmwfact(-0.05)
-    end, {
-        description = "decrease master width factor",
-        group = "layout"
-    }),
-    awful.key({ modkey, "Shift" }, "h", function()
-        awful.tag.incnmaster(1, nil, true)
-    end, {
-        description = "increase the number of master clients",
-        group = "layout"
-    }),
-    awful.key({ modkey, "Shift" }, "l", function()
-        awful.tag.incnmaster(-1, nil, true)
-    end, {
-        description = "decrease the number of master clients",
-        group = "layout"
-    }),
     awful.key({ modkey, "Control" }, "h", function()
         awful.tag.incncol(1, nil, true)
     end, {
@@ -398,12 +374,12 @@ globalkeys = gears.table.join(awful.key({ modkey }, "s", hotkeys_popup.show_help
     }),
 
     -- Prompt
-    awful.key({ modkey }, "r", function()
-        awful.screen.focused().mypromptbox:run()
-    end, {
-        description = "run prompt",
-        group = "launcher"
-    }),
+    -- awful.key({ modkey }, "r", function()
+    --     awful.screen.focused().mypromptbox:run()
+    -- end, {
+    --     description = "run prompt",
+    --     group = "launcher"
+    -- }),
     -- awful.key({ modkey }, "x", function()
     --     awful.prompt.run {
     --         prompt = "Run Lua code: ",
@@ -415,7 +391,7 @@ globalkeys = gears.table.join(awful.key({ modkey }, "s", hotkeys_popup.show_help
     --     description = "lua execute prompt",
     --     group = "awesome"
     -- }),
-    awful.key({ modkey }, "b", function()
+    awful.key({ modkey }, "\\", function()
         splitscreen:toggle_layout()
     end, {
         description = "toggle fake screen layout",
@@ -451,7 +427,10 @@ globalkeys = gears.table.join(awful.key({ modkey }, "s", hotkeys_popup.show_help
     end, {
         description = "decrease brightness",
         group = "custom"
-    })
+    }),
+
+    awful.key({ modkey }, "a", naughty.destroy_all_notifications,
+        { description = "clear notifications", group = "awesome" })
 )
 
 clientkeys = gears.table.join(awful.key({ modkey }, "f", function(c)
@@ -477,7 +456,13 @@ clientkeys = gears.table.join(awful.key({ modkey }, "f", function(c)
         description = "move to master",
         group = "client"
     }),
-    awful.key({ modkey }, "o", function(c)
+    awful.key({ modkey }, "Left", function(c)
+        c:move_to_screen()
+    end, {
+        description = "move to screen",
+        group = "client"
+    }),
+    awful.key({ modkey }, "Right", function(c)
         c:move_to_screen()
     end, {
         description = "move to screen",
@@ -734,5 +719,20 @@ client.connect_signal("unfocus", function(c)
     c.border_color = beautiful.border_normal
 end)
 -- }}}
+
+--- Test keygrabber
+local a = awful.keygrabber {
+    stop_key         = "Escape",
+    start_callback   = function() naughty.notify { text = "start 1" } end,
+    stop_callback    = function() naughty.notify { text = "stop 1" } end,
+    root_keybindings = {
+        { { "Mod4" }, "b", function() end },
+    },
+    keybindings      = {
+        { {}, "x", function()
+            naughty.notify { text = "in grabber 1" }
+        end },
+    },
+}
 
 splitscreen:init_layout()

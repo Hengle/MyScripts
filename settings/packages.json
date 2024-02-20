@@ -91,6 +91,9 @@
     }
   },
   "eternalterminal": {
+    "apt": {
+      "packages": ["et"]
+    },
     "termux": {
       "packages": ["et"]
     },
@@ -269,6 +272,11 @@
       "packagePath": "github.com/iawia002/lux@latest"
     }
   },
+  "mermaid-cli": {
+    "npm": {
+      "packages": ["@mermaid-js/mermaid-cli"]
+    }
+  },
   "miniconda3": {
     "choco": {
       "packages": ["miniconda3"]
@@ -359,6 +367,17 @@
     },
     "termux": {
       "packages": ["putty-tools"]
+    }
+  },
+  "rclone": {
+    "choco": {
+      "packages": ["rclone"]
+    },
+    "pacman": {
+      "packages": ["rclone"]
+    },
+    "termux": {
+      "packages": ["rclone"]
     }
   },
   "remmina": {

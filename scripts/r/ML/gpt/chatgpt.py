@@ -25,7 +25,10 @@ def extract_code_from_markdown(s: str) -> List[str]:
 
 
 class ChatMenu(Menu[_Line]):
-    def __init__(self, first_message: Optional[str] = None) -> None:
+    def __init__(
+        self, first_message: Optional[str] = None, model: Optional[str] = None
+    ) -> None:
+        self.__model = model
         self.__lines: List[_Line] = []
         self.__messages: List[Dict[str, str]] = []
         super().__init__(
@@ -36,9 +39,11 @@ class ChatMenu(Menu[_Line]):
             line_number=True,
         )
         self.__first_message = first_message
+        self.__last_yanked_line: Optional[_Line] = None
+        self.__yank_mode = 0
 
         self.add_command(self.start_new_chat, hotkey="ctrl+n")
-        self.add_command(self.__yank_message, hotkey="ctrl+y")
+        self.add_command(self.__yank, hotkey="ctrl+y")
 
         self.start_new_chat()
 
@@ -56,7 +61,7 @@ class ChatMenu(Menu[_Line]):
         message_index = len(self.__messages)
         line = _Line(role="assistant", text="", message_index=message_index)
         self.append_item(line)
-        for chunk in chat_completion(self.__messages):
+        for chunk in chat_completion(self.__messages, model=self.__model):
             response += chunk
             for i, a in enumerate(chunk.split("\n")):
                 if i > 0:
@@ -103,21 +108,42 @@ class ChatMenu(Menu[_Line]):
 
     def on_enter_pressed(self):
         text = self.get_input()
-        self.__send_message(text)
         self.clear_input()
+        self.__send_message(text)
 
-    def __yank_message(self):
-        line = self.get_selected_item()
-        if line is not None:
-            message = self.__messages[line.message_index]
-            message_text = message["content"]
-            code_block = extract_code_from_markdown(message_text)
-            if len(code_block) > 0:
-                set_clip(code_block[0])
-                self.set_message("code copied.")
-            else:
-                set_clip(message_text)
-                self.set_message("message copied.")
+    def __yank(self):
+        indices = list(self.get_selected_indices())
+        if len(indices) == 1:
+            idx = indices[0]
+            line = self.__lines[idx]
+            if line != self.__last_yanked_line:
+                self.__yank_mode = 0
+                self.__last_yanked_line = line
+
+            if self.__yank_mode == 0:
+                set_clip(line.text)
+                self.set_message(f"line {idx+1} copied")
+                self.__yank_mode = 1
+
+            elif self.__yank_mode == 1:
+                message = self.__messages[line.message_index]
+                message_text = message["content"]
+                code_block = extract_code_from_markdown(message_text)
+                if len(code_block) > 0:
+                    set_clip(code_block[0])
+                    self.set_message("code copied")
+                else:
+                    set_clip(message_text)
+                    self.set_message("message copied")
+                self.__yank_mode = 0
+        elif len(indices) > 1:
+            line_text = []
+            for idx in indices:
+                line = self.__lines[idx]
+                line_text.append(line.text)
+            set_clip("\n".join(line_text))
+            self.set_message("selected line copied")
+            self.set_multi_select(False)
 
 
 if __name__ == "__main__":

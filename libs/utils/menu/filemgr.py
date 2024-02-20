@@ -8,6 +8,7 @@ from _editor import open_code_editor
 from _shutil import get_home_path, shell_open
 
 from utils.clip import set_clip
+from utils.menu.logviewer import LogViewerMenu
 
 from . import Menu
 from .confirm import confirm
@@ -76,14 +77,13 @@ class FileManager(Menu[_File]):
         self.add_command(self._copy_file_full_path, hotkey="ctrl+y")
         self.add_command(self._copy_to, hotkey="ctrl+y")
         self.add_command(self._create_new_dir, hotkey="ctrl+n")
-        self.add_command(self._delete_file, hotkey="ctrl+k")
-        self.add_command(self._delete_file, hotkey="delete")
+        self.add_command(self._delete_files, hotkey="ctrl+k")
         self.add_command(self._edit_text_file, hotkey="ctrl+e")
         self.add_command(self._goto_home, hotkey="alt+h")
         self.add_command(self._goto_parent_directory, hotkey="left")
         self.add_command(self._goto_selected_directory, hotkey="right")
         self.add_command(self._goto, hotkey="ctrl+g")
-        self.add_command(self._list_files_recursively)
+        self.add_command(self._list_files_recursively, hotkey="alt+r")
         self.add_command(self._refresh_current_directory, hotkey="ctrl+r")
         self.add_command(self._rename_file, hotkey="alt+n")
         self.add_command(self._reveal_in_file_explorer, hotkey="ctrl+o")
@@ -125,15 +125,23 @@ class FileManager(Menu[_File]):
         if file_full_path is not None:
             self.call_func_without_curses(lambda: open_code_editor(file_full_path))
 
-    def _delete_file(self):
-        file_full_path = self.get_selected_file_full_path()
-        if file_full_path is not None:
-            if confirm(f'Delete "{file_full_path}"?'):
-                if os.path.isdir(file_full_path):
-                    shutil.rmtree(file_full_path)
-                else:
-                    os.remove(file_full_path)
+    def _delete_files(self):
+        files = self.get_selected_files()
+
+        if len(files) > 0:
+            if len(files) == 1:
+                question = f'Delete "{files[0]}"?'
+            else:
+                question = f"Delete {len(files)} files?"
+            if confirm(question):
+                for file_full_path in files:
+                    if os.path.isdir(file_full_path):
+                        shutil.rmtree(file_full_path)
+                    else:
+                        os.remove(file_full_path)
                 self._refresh_current_directory()
+
+            self.update_screen()
 
     def _copy_to(self):
         src_file = self.get_selected_file_full_path()
@@ -218,6 +226,7 @@ class FileManager(Menu[_File]):
 
     def _refresh_current_directory(self):
         self.goto_directory(self.get_cur_dir())
+        self.set_multi_select(False)
 
     def goto_directory(
         self,
@@ -312,6 +321,12 @@ class FileManager(Menu[_File]):
         else:
             return None
 
+    def get_selected_files(self) -> List[str]:
+        return [
+            os.path.join(self.get_cur_dir(), file.name)
+            for file in self.get_selected_items()
+        ]
+
     def on_exit(self):
         selected = self.get_selected_item(ignore_cancellation=True)
         if selected:
@@ -320,6 +335,13 @@ class FileManager(Menu[_File]):
             self.__config.selected_file = os.path.basename(selected_full_path)
             if self.__save_states:
                 self.__config.save()
+
+    def open_file(self, full_path: str):
+        _, ext = os.path.splitext(full_path)
+        if ext.lower() == ".log":
+            LogViewerMenu(file=full_path).exec()
+        else:
+            shell_open(full_path)
 
     def on_enter_pressed(self):
         if self.__select_mode == FileManager.SELECT_MODE_DIRECTORY:
@@ -339,5 +361,5 @@ class FileManager(Menu[_File]):
                     if self.__select_mode == FileManager.SELECT_MODE_FILE:
                         return super().on_enter_pressed()
                     else:
-                        shell_open(full_path)
+                        self.open_file(full_path)
                         return True
